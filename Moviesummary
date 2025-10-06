@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Real-Plot-140: Generate a 140-character satirical 'real plot' summary + poster image
+- Free stack: TMDb + Wikipedia + Transformers (optional) + Diffusers (Stable Diffusion)
+- Phase 2 ready: approval loop stubs and pluggable publisher
+"""
+
+import os
+import re
+import json
+import time
+import random
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from slugify import slugify
+
+# Optional: small instruct model (try smaller models if resource-limited)
+USE_LLM = True
+LLM_MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"  # swap to a smaller instruct model if needed
+
+# Image generation
+from diffusers import StableDiffusionPipeline
+import torch
+
+# ------------- Config -------------
+
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")  # set your key as env var
+OUT_DIR = os.getenv("OUT_DIR", "outputs")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+SEED = 1234
+random.seed(SEED)
+
+# ------------- Utilities -------------
+
+def clean_text(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def truncate140(s: str) -> str:
+    s = clean_text(s)
+    return s[:140]
+
+def safe_title(title: str) -> str:
+    return clean_text(title)
+
+def log_json(path: str, data: Dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ------------- Data: TMDb -------------
+
+TMDB_BASE = "https://api.themoviedb.org/3"
+
+def tmdb_get(endpoint: str, params: Dict = None) -> Dict:
+    if not TMDB_API_KEY:
+        raise RuntimeError("TMDB_API_KEY not set")
+    params = params or {}
+    params["api_key"] = TMDB_API_KEY
+    r = requests.get(f"{TMDB_BASE}/{endpoint}", params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def pick_popular_movie() -> Dict:
+    # Choose from 'popular' or 'top_rated' for recognizability; shuffle for variety
+    source = random.choice(["movie/popular", "movie/top_rated"])
+    data = tmdb_get(source, params={"language": "en-US", "page": random.randint(1, 3)})
+    candidates = data.get("results", [])
+    random.shuffle(candidates)
+    # Filter out edge cases (very new, low votes) to keep broad audience appeal
+    for m in candidates:
+        if m.get("vote_count", 0) >= 500 and m.get("original_language") == "en":
+            return m
+    return candidates[0] if candidates else {}
+
+def tmdb_movie_details(movie_id: int) -> Dict:
+    return tmdb_get(f"movie/{movie_id}", params={"language": "en-US"})
+
+def tmdb_reviews(movie_id: int) -> List[Dict]:
+    data = tmdb_get(f"movie/{movie_id}/reviews", params={"language": "en-US", "page": 1})
+    return data.get("results", [])
+
+# ------------- Data: Wikipedia -------------
+
+WIKI_API = "https://en.wikipedia.org/w/api.php"
+
+def wiki_search(title: str) -> Optional[int]:
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": title,
+        "format": "json",
+    }
+    r = requests.get(WIKI_API, params=params, timeout=20)
+    r.raise_for_status()
+    results = r.json().get("query", {}).get("search", [])
+    if not results:
+        return None
+    # Prefer exact or near-exact match
+    for res in results:
+        if res["title"].lower().startswith(title.lower()):
+            return res["pageid"]
+    return results[0]["pageid"]
+
+def wiki_extract_plot(pageid: int) -> Optional[str]:
+    # Get sections, find 'Plot' or similar, then extract
+    params = {"action": "parse", "pageid": pageid, "prop": "sections", "format": "json"}
+    r = requests.get(WIKI_API, params=params, timeout=20)
+    r.raise_for_status()
+    sections = r.json().get("parse", {}).get("sections", [])
+    plot_index = None
+    for sec in sections:
+        if "plot" in sec.get("line", "").lower():
+            plot_index = sec.get("index")
+            break
+    if not plot_index:
+        return None
+    params = {"action": "parse", "pageid": pageid, "prop": "wikitext", "section": plot_index, "format": "json"}
+    r = requests.get(WIKI_API, params=params, timeout=20)
+    r.raise_for_status()
+    wikitext = r.json().get("parse", {}).get("wikitext", {}).get("*", "")
+    # Strip basic wiki markup
+    text = re.sub(r"\{\{.*?\}\}", " ", wikitext, flags=re.S)
+    text = re.sub(r"\[\[(?:[^\|\]]*\|)?([^\]]+)\]\]", r"\1", text)  # links [[A|B]] -> B
+    text = re.sub(r"==.*?==", " ", text)
+    text = re.sub(r"<.*?>", " ", text)
+    text = clean_text(text)
+    return text if text else None
+
+# ------------- Humor synthesis -------------
+
+def extract_sentiment_clauses(reviews: List[Dict]) -> List[str]:
+    clauses = []
+    for rv in reviews[:10]:
+        content = clean_text(rv.get("content", ""))
+        if not content:
+            continue
+        # Take short impactful bits
+        for chunk in re.split(r"[.;!?]", content):
+            chunk = clean_text(chunk)
+            if 10 < len(chunk) < 160:
+                clauses.append(chunk)
+    random.shuffle(clauses)
+    return clauses[:6]
+
+def compress_absurdity(plot: str, clauses: List[str]) -> str:
+    """
+    Deterministic satire compressor (fallback if no LLM):
+    - Surface contradictions: protagonist goal vs chaos
+    - Pull a spicy clause to hint at audience POV
+    - Punchline structure: X tries to Y; audience sees Z; chaos ensues.
+    """
+    # Rough protagonist/goal extraction
+    m = re.search(r"([A-Z][a-z]+)\s*(?:,|\sis|\sat|\s—)\s.*?\.", plot)
+    protagonist = m.group(1) if m else "Someone"
+    goal = "fixes a mess" if "save" not in plot.lower() else "tries to save the day"
+    pov = clauses[0] if clauses else "audience laughs, cries, and side-eyes"
+    skeleton = f"{protagonist} {goal}; {pov}. Chaos, coincidences, and feelings. Credits roll."
+    return truncate140(skeleton)
+
+# Optional LLM
+text_gen = None
+def init_llm():
+    global text_gen
+    if not USE_LLM:
+        return
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+        tok = AutoTokenizer.from_pretrained(LLM_MODEL_ID)
+        model = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL_ID,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+        )
+        text_gen = pipeline("text-generation", model=model, tokenizer=tok)
+    except Exception as e:
+        print(f"[LLM init] Falling back to deterministic: {e}")
+        text_gen = None
+
+def llm_summary(title: str, plot: str, clauses: List[str]) -> str:
+    prompt = (
+        f"Task: Write a 140-character, witty, ironic 'real plot' summary of a well-known movie.\n"
+        f"Title: {title}\n"
+        f"Official plot (condensed): {plot[:900]}\n"
+        f"Audience/critic vibes: {', '.join(clauses)}\n"
+        f"Constraints: Max 140 chars. Be punchy, relatable, and highlight absurdity without explicit or sensitive content. No spoilers beyond premise.\n"
+        f"Output only the single-line summary."
+    )
+    try:
+        out = text_gen(prompt, max_new_tokens=60, do_sample=True, temperature=0.8, top_p=0.9)[0]["generated_text"]
+        # Extract last line, truncate
+        lines = [clean_text(l) for l in out.split("\n") if l.strip()]
+        return truncate140(lines[-1])
+    except Exception as e:
+        print(f"[LLM gen] Fallback to deterministic: {e}")
+        return compress_absurdity(plot, clauses)
+
+# ------------- Poster prompt + image -------------
+
+def build_poster_prompt(title: str, summary: str) -> str:
+    """
+    Poster prompt style: bold, minimal, clear character silhouettes, cheeky thought bubbles.
+    Avoid sensitive themes; keep playful and ironic.
+    """
+    base = (
+        f"Movie poster for '{title}', minimalist, bold colors, dynamic composition, retro cinema texture, "
+        f"clear silhouette of protagonist and key motif, playful thought bubble that echoes: '{summary}'. "
+        f"Clean typography, high contrast, 3:4 aspect, cinematic lighting."
+    )
+    return base
+
+def init_sd_pipeline() -> StableDiffusionPipeline:
+    model_id = "runwayml/stable-diffusion-v1-5"  # widely used, works in diffusers
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        safety_checker=None,
+        use_safetensors=True
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe = pipe.to(device)
+    return pipe
+
+def generate_poster(pipe: StableDiffusionPipeline, prompt: str, out_path: str):
+    g = None
+    if torch.cuda.is_available():
+        g = torch.Generator(device="cuda").manual_seed(SEED)
+    else:
+        g = torch.Generator().manual_seed(SEED)
+    img = pipe(prompt, num_inference_steps=30, guidance_scale=7.5, generator=g).images[0]
+    img.save(out_path)
+
+# ------------- Approval loop (Phase 2 ready) -------------
+
+def approval_loop(title: str, summary: str, img_path: str) -> bool:
+    """
+    CLI loop: display outputs, ask accept/reject.
+    Replace with a simple web UI later (Flask) to manage multiple accounts.
+    """
+    print("\n--- Candidate ---")
+    print(f"Title: {title}")
+    print(f"140-char summary:\n  {summary}")
+    print(f"Poster saved at: {img_path}")
+    choice = input("\nApprove? [y/N]: ").strip().lower()
+    return choice == "y"
+
+# ------------- Main pipeline -------------
+
+def run_once():
+    init_llm()
+
+    movie = pick_popular_movie()
+    title = safe_title(movie.get("title") or movie.get("name") or "Unknown")
+    movie_id = movie.get("id")
+    details = tmdb_movie_details(movie_id)
+    overview = clean_text(details.get("overview", ""))
+
+    pageid = wiki_search(title)
+    plot_text = None
+    if pageid:
+        plot_text = wiki_extract_plot(pageid)
+    plot = plot_text if plot_text else overview
+
+    reviews = tmdb_reviews(movie_id)
+    clauses = extract_sentiment_clauses(reviews)
+
+    # Generate summary
+    if text_gen:
+        summary = llm_summary(title, plot, clauses)
+    else:
+        summary = compress_absurdity(plot, clauses)
+
+    # Poster prompt + image
+    poster_prompt = build_poster_prompt(title, summary)
+    pipe = init_sd_pipeline()
+    fname = slugify(f"{title}-{int(time.time())}") + ".png"
+    out_path = os.path.join(OUT_DIR, fname)
+    generate_poster(pipe, poster_prompt, out_path)
+
+    # Log
+    payload = {
+        "title": title,
+        "tmdb_id": movie_id,
+        "summary_140": summary,
+        "poster_prompt": poster_prompt,
+        "poster_path": out_path,
+        "source_overview": overview,
+        "used_wikipedia": bool(plot_text),
+        "review_clauses": clauses,
+    }
+    log_json(os.path.join(OUT_DIR, slugify(title) + ".json"), payload)
+
+    # Approval loop stub (Phase 2)
+    approved = approval_loop(title, summary, out_path)
+    if approved:
+        print("Approved. Ready to publish via your chosen publisher module.")
+        # TODO: call publisher (X/Bluesky/Mastodon). For X, consider manual post or browser automation.
+    else:
+        print("Rejected. Regenerating with a different movie...")
+        return run_once()
+
+if __name__ == "__main__":
+    print("Starting Real-Plot-140 pipeline...")
+    run_once()
